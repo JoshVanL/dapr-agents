@@ -163,6 +163,11 @@ class AgentBase:
         self.profile = resolved_profile
         self.name = resolved_profile.name  # type: ignore[assignment]
 
+        # Flag used by DurableAgent/Orchestrator flows to suppress certain
+        # console output and adjust behavior during internal orchestration.
+        # Regular agents default to False.
+        self.orchestrator: bool = False
+
         self._runtime_secrets: Dict[str, str] = {}
         self._runtime_conf: Dict[str, str] = {}
         self._agent_observability = agent_observability
@@ -496,9 +501,23 @@ class AgentBase:
         """Delegate to DaprInfra."""
         return self._infra.load_state()
 
-    def save_state(self, workflow_instance_id: str) -> None:
-        """Delegate to DaprInfra."""
-        return self._infra.save_state(workflow_instance_id=workflow_instance_id)
+    def save_state(self, *args, **kwargs) -> None:
+        """Delegate to DaprInfra.
+
+        Some older internal call-sites used a different signature and passed
+        positional arguments. We accept and ignore them to keep backward
+        compatibility.
+        """
+        return self._infra.save_state()
+
+    def get_workflow_entry(self, workflow_instance_id: str):
+        """Backward-compatible alias for retrieving a workflow entry.
+
+        DurableAgent's workflow activities historically referenced
+        `get_workflow_entry(...)`. Internally, workflow instances are stored as
+        `AgentWorkflowEntry` objects in the infra state.
+        """
+        return self.get_state(workflow_instance_id)
 
     def ensure_instance_exists(
         self,
@@ -991,7 +1010,7 @@ class AgentBase:
             if hasattr(entry, "last_message"):
                 entry.last_message = message_model  # type: ignore[attr-defined]
 
-        self.save_state(workflow_instance_id=instance_id)
+        self.save_state()
 
     def _save_assistant_message(
         self, instance_id: str, assistant_message: Dict[str, Any]
@@ -1031,7 +1050,7 @@ class AgentBase:
                 if hasattr(entry, "last_message"):
                     entry.last_message = message_model  # type: ignore[attr-defined]
 
-        self.save_state(instance_id)
+        self.save_state()
 
     # ------------------------------------------------------------------
     # Small convenience wrappers

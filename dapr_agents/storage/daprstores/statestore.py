@@ -43,6 +43,21 @@ def _coerce_state_options(
     return StateOptions(**dict(state_options))  # type: ignore[arg-type]
 
 
+def _coerce_metadata(
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """Coerce metadata keys/values to strings for the Dapr gRPC client.
+
+    The Dapr Python SDK's gRPC request types expect `map<string,string>`.
+    Passing ints/bools (or non-str keys) can raise `TypeError: bad argument type
+    for built-in operation` at protobuf construction time.
+    """
+
+    if metadata is None:
+        return None
+    return {str(k): str(v) for k, v in metadata.items()}
+
+
 class DaprStateStore(DaprStoreBase):
     """
     Thin wrapper around Dapr state APIs returning raw gRPC response types.
@@ -70,8 +85,8 @@ class DaprStateStore(DaprStoreBase):
         with DaprClient() as client:
             return client.get_state(
                 store_name=self.store_name,
-                key=key,
-                state_metadata=state_metadata,
+                key=str(key),
+                state_metadata=_coerce_metadata(state_metadata),
             )
 
     def try_get_state(
@@ -91,7 +106,7 @@ class DaprStateStore(DaprStoreBase):
             (exists, payload_dict_or_none)
         """
         response = self.get_state(
-            key=key,
+            key=str(key),
             state_metadata=state_metadata,
         )
         if response and response.data:
@@ -119,9 +134,9 @@ class DaprStateStore(DaprStoreBase):
         with DaprClient() as client:
             response: BulkStatesResponse = client.get_bulk_state(
                 store_name=self.store_name,
-                keys=keys,
+                keys=[str(k) for k in keys],
                 parallelism=parallelism,
-                states_metadata=states_metadata or {},
+                states_metadata=_coerce_metadata(states_metadata or {}) or {},
             )
             return response.items or []
 
@@ -148,9 +163,9 @@ class DaprStateStore(DaprStoreBase):
         with DaprClient() as client:
             client.save_state(
                 store_name=self.store_name,
-                key=key,
+                key=str(key),
                 value=value,
-                state_metadata=state_metadata,
+                state_metadata=_coerce_metadata(state_metadata),
                 etag=etag,
                 options=options,
             )
@@ -171,7 +186,7 @@ class DaprStateStore(DaprStoreBase):
             client.save_bulk_state(
                 store_name=self.store_name,
                 states=states,
-                metadata=metadata,
+                metadata=_coerce_metadata(metadata),
             )
 
     def delete_state(
@@ -195,10 +210,10 @@ class DaprStateStore(DaprStoreBase):
         with DaprClient() as client:
             client.delete_state(
                 store_name=self.store_name,
-                key=key,
+                key=str(key),
                 etag=etag,
                 options=options,
-                state_metadata=state_metadata,
+                state_metadata=_coerce_metadata(state_metadata),
             )
 
     def query_state(
@@ -221,7 +236,7 @@ class DaprStateStore(DaprStoreBase):
             return client.query_state(
                 store_name=self.store_name,
                 query=query,
-                states_metadata=states_metadata,
+                states_metadata=_coerce_metadata(states_metadata),
             )
 
     def execute_state_transaction(
@@ -244,5 +259,5 @@ class DaprStateStore(DaprStoreBase):
             client.execute_state_transaction(
                 store_name=self.store_name,
                 operations=list(operations),
-                metadata=metadata,
+                metadata=_coerce_metadata(metadata),
             )

@@ -75,7 +75,14 @@ def _resolve_loop(
     try:
         return asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.get_event_loop()
+        # Python 3.12+ no longer creates an implicit "current" loop.
+        # If no loop is set for this thread, create and set one.
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            return new_loop
 
 
 def _iter_decorated(target: Any, attr: str):

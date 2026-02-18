@@ -62,6 +62,7 @@ from dapr_agents.types import (
 )
 from dapr_agents.types.workflow import DaprWorkflowStatus
 from dapr_agents.tool.utils.serialization import serialize_tool_result
+from dapr_agents.tool.workflow_context import WorkflowContextInjectedTool
 from dapr_agents.workflow.decorators import message_router, workflow_entry
 from dapr_agents.workflow.utils.grpc import apply_grpc_options
 from dapr_agents.workflow.utils.pubsub import broadcast_message, send_message_to_agent
@@ -342,6 +343,19 @@ class DurableAgent(AgentBase):
                         retry_policy=self._retry_policy,
                     )
 
+                    # Persist the assistant response (including any tool_calls)
+                    # before executing tools so that conversation history remains
+                    # OpenAI-compatible: user -> assistant(tool_calls) -> tool.
+                    yield ctx.call_activity(
+                        self.record_assistant_entry,
+                        input={
+                            "instance_id": ctx.instance_id,
+                            "assistant_response": assistant_response,
+                            "time": ctx.current_utc_datetime.isoformat(),
+                        },
+                        retry_policy=self._retry_policy,
+                    )
+
                     tool_calls = assistant_response.get("tool_calls") or []
                     if tool_calls:
                         if not ctx.is_replaying:
@@ -351,20 +365,63 @@ class DurableAgent(AgentBase):
                                 len(tool_calls),
                                 turn,
                             )
-                        parallel = [
-                            ctx.call_activity(
-                                self.run_tool,
-                                input={
-                                    "tool_call": tc,
-                                    "instance_id": ctx.instance_id,
-                                    "time": ctx.current_utc_datetime.isoformat(),
-                                    "order": idx,
-                                },
-                                retry_policy=self._retry_policy,
+                        # Tool calls can be executed either:
+                        #   - via activities (default), or
+                        #   - directly in the orchestrator when the tool requires `ctx`
+                        #     (WorkflowContextInjectedTool), e.g. MCP-over-workflow.
+                        parallel: List[Any] = []
+                        meta: List[Dict[str, Any]] = []
+                        for idx, tc in enumerate(tool_calls):
+                            fn_name = tc.get("function", {}).get("name")
+                            tool_obj = self.tool_executor.get_tool(fn_name) if fn_name else None
+
+                            if tool_obj and isinstance(tool_obj, WorkflowContextInjectedTool):
+                                raw_args = tc["function"].get("arguments", "")
+                                try:
+                                    args = json.loads(raw_args) if raw_args else {}
+                                except json.JSONDecodeError as exc:
+                                    raise AgentError(f"Invalid JSON in tool args: {exc}") from exc
+
+                                parallel.append(tool_obj(ctx=ctx, **args))
+                                meta.append({"kind": "workflow", "tool_call": tc, "order": idx})
+                            else:
+                                parallel.append(
+                                    ctx.call_activity(
+                                        self.run_tool,
+                                        input={
+                                            "tool_call": tc,
+                                            "instance_id": ctx.instance_id,
+                                            "time": ctx.current_utc_datetime.isoformat(),
+                                            "order": idx,
+                                        },
+                                        retry_policy=self._retry_policy,
+                                    )
+                                )
+                                meta.append({"kind": "activity", "tool_call": tc, "order": idx})
+
+                        raw_results: List[Any] = yield wf.when_all(parallel)
+
+                        tool_results: List[Dict[str, Any]] = []
+                        for res, m in zip(raw_results, meta):
+                            if m["kind"] == "activity":
+                                # run_tool already returns a ToolMessage dict
+                                tool_results.append(res)
+                                continue
+
+                            # Workflow-injected tool: wrap the raw result into a ToolMessage dict
+                            tc = m["tool_call"]
+                            fn_name = tc["function"]["name"]
+                            serialized_result = serialize_tool_result(res)
+                            tool_msg = ToolMessage(
+                                content=serialized_result,
+                                role="tool",
+                                name=fn_name,
+                                tool_call_id=tc["id"],
                             )
-                            for idx, tc in enumerate(tool_calls)
-                        ]
-                        tool_results: List[Dict[str, Any]] = yield wf.when_all(parallel)
+                            if not ctx.is_replaying and not self.orchestrator:
+                                self.text_formatter.print_message(tool_msg)
+                            tool_results.append(tool_msg.model_dump())
+
                         yield ctx.call_activity(
                             self.save_tool_results,
                             input={
@@ -1214,11 +1271,74 @@ class DurableAgent(AgentBase):
         entry.start_time = start_time
         entry.trace_context = trace_context
 
+        # Persist the triggering user message in both the per-workflow state
+        # and long-term memory. This keeps the conversation history coherent,
+        # especially when tool calls occur in later steps.
+        if isinstance(input_value, str) and input_value.strip():
+            entry.messages.append(
+                AgentWorkflowMessage(
+                    role="user",
+                    content=input_value,
+                )
+            )
+            try:
+                self.memory.add_message(UserMessage(content=input_value))
+            except Exception:
+                # Memory should never break the workflow; if persistence fails
+                # we'll continue with the in-workflow state.
+                logger.exception("Failed to persist user message to memory")
+
         session_id = getattr(self.memory, "session_id", None)
         if session_id is not None and hasattr(entry, "session_id"):
             entry.session_id = str(session_id)
 
         entry.status = DaprWorkflowStatus.RUNNING.value
+        # AgentBase.save_state() persists the agent's infra state and no longer
+        # accepts (instance_id, entry) arguments.
+        self.save_state()
+
+    def record_assistant_entry(
+        self, ctx: WorkflowActivityContext, payload: Dict[str, Any]
+    ) -> None:
+        """Persist an assistant response into workflow state and long-term memory.
+
+        This stores the assistant message **including tool_calls**. Without this,
+        subsequent calls can end up with orphaned tool messages, which OpenAI
+        rejects (tool messages must follow an assistant tool_calls message).
+        """
+
+        instance_id = payload.get("instance_id")
+        assistant_response: Dict[str, Any] = payload.get("assistant_response") or {}
+
+        if not instance_id:
+            raise ValueError("instance_id is required")
+
+        role = assistant_response.get("role", "assistant")
+        content = assistant_response.get("content")
+        tool_calls = assistant_response.get("tool_calls")
+
+        entry = self.get_workflow_entry(instance_id)
+        entry.messages.append(
+            AgentWorkflowMessage(
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+            )
+        )
+
+        # Best-effort long-term memory persistence
+        try:
+            if role == "assistant":
+                self.memory.add_message(
+                    AssistantMessage(
+                        content=content,
+                        tool_calls=tool_calls,
+                    )
+                )
+        except Exception:
+            logger.exception("Failed to persist assistant message to memory")
+
+        # Persist updated workflow state.
         self.save_state()
 
     def call_llm(
@@ -1781,6 +1901,7 @@ class DurableAgent(AgentBase):
 
         # Standard agent activities
         runtime.register_activity(self.record_initial_entry)
+        runtime.register_activity(self.record_assistant_entry)
         runtime.register_activity(self.call_llm)
         runtime.register_activity(self.run_tool)
         runtime.register_activity(self.save_tool_results)

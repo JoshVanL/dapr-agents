@@ -13,14 +13,15 @@ from dapr_agents.types import BaseMessage
 logger = logging.getLogger(__name__)
 
 
-def generate_numeric_session_id() -> int:
+def generate_numeric_session_id() -> str:
     """
     Generates a random numeric session ID by extracting digits from a UUID.
 
     Returns:
-        int: A numeric session ID.
+        str: A numeric session ID (string). Dapr gRPC APIs expect string keys.
     """
-    return int("".join(filter(str.isdigit, str(uuid.uuid4()))))
+    # NOTE: keep as string to avoid type errors when used as a Dapr state key
+    return "".join(filter(str.isdigit, str(uuid.uuid4())))
 
 
 class ConversationDaprStateMemory(MemoryBase):
@@ -32,8 +33,9 @@ class ConversationDaprStateMemory(MemoryBase):
     store_name: str = Field(
         default="statestore", description="The name of the Dapr state store."
     )
-    session_id: Optional[Union[str, int]] = Field(
-        default=None, description="Unique identifier for the conversation session."
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Unique identifier for the conversation session (stored as string).",
     )
 
     dapr_store: Optional[DaprStateStore] = Field(
@@ -53,6 +55,9 @@ class ConversationDaprStateMemory(MemoryBase):
         """
         if not values.get("session_id"):
             values["session_id"] = generate_numeric_session_id()
+        else:
+            # Be defensive: ensure any provided session_id is stored as string.
+            values["session_id"] = str(values["session_id"])
         return values
 
     def model_post_init(self, __context: Any) -> None:
@@ -96,8 +101,9 @@ class ConversationDaprStateMemory(MemoryBase):
         max_attempts = 10
         for attempt in range(1, max_attempts + 1):
             try:
+                session_key = str(self.session_id)
                 response = self.dapr_store.get_state(
-                    self.session_id,
+                    session_key,
                     state_metadata={"contentType": "application/json"},
                 )
 
@@ -111,7 +117,7 @@ class ConversationDaprStateMemory(MemoryBase):
                 existing.append(message)
                 # Save with etag - will fail if someone else modified it
                 self.dapr_store.save_state(
-                    self.session_id,
+                    session_key,
                     json.dumps(existing),
                     state_metadata={"contentType": "application/json"},
                     etag=etag,

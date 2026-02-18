@@ -194,18 +194,35 @@ class DaprChatClient(DaprInferenceClientBase, ChatClientBase):
         history_messages: List[ConversationMessage] = []
         scrub_flags: List[bool] = []
 
+        # OpenAI (and the Dapr Conversation -> OpenAI adapter) requires that any
+        # message with role="tool" appears *immediately after* an assistant
+        # message that contains a matching tool_calls entry.
+        #
+        # In long-lived sessions it’s possible for persisted history to contain
+        # orphan tool messages (e.g., partial writes, manual edits, truncation).
+        # To avoid hard failures (HTTP 400), we drop any tool messages that do
+        # not have a corresponding, most-recent assistant tool_calls id.
+        expected_tool_call_ids: set[str] = set()
+
         for item in inputs:
             role = item.get("role")
             content = item.get("content", "")
 
             if role == "user":
+                expected_tool_call_ids.clear()
                 msg = create_user_message(content)
             elif role == "system":
+                expected_tool_call_ids.clear()
                 msg = create_system_message(content)
             elif role == "assistant":
                 # Preserve assistant tool_calls if present (OpenAI-like schema)
                 tool_calls_data = item.get("tool_calls") or []
                 if tool_calls_data:
+                    expected_tool_call_ids = {
+                        str(tc.get("id"))
+                        for tc in tool_calls_data
+                        if isinstance(tc, dict) and tc.get("id")
+                    }
                     converted_calls: List[ConversationToolCalls] = []
                     for tc in tool_calls_data:
                         fn = tc.get("function", {}) if isinstance(tc, dict) else {}
@@ -234,11 +251,25 @@ class DaprChatClient(DaprInferenceClientBase, ChatClientBase):
                         )
                     )
                 else:
+                    expected_tool_call_ids.clear()
                     msg = create_assistant_message(content)
             elif role == "tool":
                 tool_id = item.get("tool_call_id") or item.get("id") or ""
                 name = item.get("name", "")
-                msg = create_tool_message(tool_id, name, content)
+                tool_id_str = str(tool_id) if tool_id is not None else ""
+
+                # Drop orphan tool messages that don't match the immediately
+                # preceding assistant.tool_calls ids.
+                if not tool_id_str or tool_id_str not in expected_tool_call_ids:
+                    logger.warning(
+                        "Dropping orphan tool message (tool_call_id=%s, name=%s)",
+                        tool_id_str,
+                        name,
+                    )
+                    continue
+
+                expected_tool_call_ids.discard(tool_id_str)
+                msg = create_tool_message(tool_id_str, name, content)
             else:
                 raise ValueError(f"Unsupported role for Alpha2 conversion: {role}")
 
